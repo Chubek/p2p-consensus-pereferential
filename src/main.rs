@@ -16,7 +16,7 @@ use libp2p::{
 use std::error::Error;
 
 #[async_std::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+pub async fn main() -> Result<(), Box<dyn Error>> {
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
 
@@ -27,6 +27,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     struct MyBehaviour {
         kademlia: Kademlia<MemoryStore>,
         mdns: Mdns,
+        
+        #[behaviour(ignore)]
+        tally: Tally,
     }
 
     impl NetworkBehaviourEventProcess<MdnsEvent> for MyBehaviour {
@@ -41,6 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     impl NetworkBehaviourEventProcess<KademliaEvent> for MyBehaviour {
         fn inject_event(&mut self, message: KademliaEvent) {
+            println!("Event took place");
             match message {
                 KademliaEvent::OutboundQueryCompleted { result, .. } => match result {
                     QueryResult::GetProviders(Ok(ok)) => {
@@ -61,11 +65,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ..
                         } in ok.records
                         {
-                            println!(
-                                "Got record {:?} {:?}",
-                                std::str::from_utf8(key.as_ref()).unwrap(),
-                                std::str::from_utf8(&value).unwrap(),
-                            );
+                            
+                            let k = std::str::from_utf8(key.as_ref()).unwrap();
+                            let v = std::str::from_utf8(&value).unwrap();
+
+                            if k.contains("INIT") {
+                                self.tally = self.tally.clone().set_bar(v.parse::<u8>().unwrap())
+                            } else if k.contains("VOTE") {
+                                let v_split = v.split("-").collect::<Vec<&str>>();
+                                self.tally = self.tally.clone().push_new(&mut self.kademlia, k, 
+                                    v_split[0], v_split[1]);
+                            } else if k.contains("TALLY") {
+                                let res = self.tally.clone().tally_up();
+
+                                println!("{:?}", res);
+                            }
                         }
                     }
                     QueryResult::GetRecord(Err(err)) => {
@@ -101,13 +115,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let store = MemoryStore::new(local_peer_id);
         let kademlia = Kademlia::new(local_peer_id, store);
         let mdns = task::block_on(Mdns::new(MdnsConfig::default()))?;
-        let behaviour = MyBehaviour { kademlia, mdns};
+        let mut tally = Tally::new();
+        let behaviour = MyBehaviour { kademlia, mdns, tally};
         Swarm::new(transport, behaviour, local_peer_id)
     };
 
 
     let mut stdin = io::BufReader::new(io::stdin()).lines().fuse(); 
-    let mut tally = Tally::new();
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
@@ -115,7 +129,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         select! {
             line = stdin.select_next_some() => handle_input_line(
-                &mut swarm.behaviour_mut().kademlia, &mut tally,
+                &mut swarm.behaviour_mut().kademlia,
                 line.expect("Stdin failed")
             ),
             event = swarm.select_next_some() => match event {
@@ -266,19 +280,23 @@ impl Tally {
         Tally { votes: tallies, keys, bar: 0u8 }
     }
 
-    pub fn set_bar(mut self, bar: u8) {
+    pub fn set_bar(mut self, bar: u8) -> Self {
         self.bar = bar;
+
+        self
     }
 
     pub fn push_new(mut self, 
                 kademlia: &mut Kademlia<MemoryStore>, 
-                key_str: &str, yay_pref: &str, nay_pref: &str) {
+                key_str: &str, yay_pref: &str, nay_pref: &str) -> Self {
         let key = Key::new(&key_str);
         
-        let new_vote = Vote::new(key, yay_pref, nay_pref);
+        let new_vote = Vote::new(key, yay_pref, nay_pref); 
 
         self.votes.push(new_vote.register(kademlia));
         self.keys.push(key_str.to_string());
+
+        self
 
     }
 
@@ -311,29 +329,44 @@ impl Tally {
 
 
 
-fn handle_input_line(kademlia: &mut Kademlia<MemoryStore>, 
-                    tally: &mut Tally, line: String) {
+fn handle_input_line(kademlia: &mut Kademlia<MemoryStore>, line: String) {
     let mut args = line.split(' ');
 
     match args.next() {
         Some("INIT") => {
+            let key = {
+                match args.next() {
+                    Some(key) => Key::new(&format!("{}-{}", "INIT", key)),
+                    None => {
+                        eprintln!("Expected vote name");
+                        return;
+                    }
+                }
+            };
             let bar = {
                 match args.next() {
-                    Some(bar) => {
-                        tally.clone().set_bar(bar.parse::<u8>().unwrap());
-                        println!("Initialized with bar {}", bar);
-                    },
+                    Some(bar) => bar.as_bytes().to_vec(),
                     None => {
                         eprintln!("Expected bar");
                         return;
                     }
                 }
-            };            
+            };
+            let record = Record {
+                key: key.clone(),
+                value: bar,
+                publisher: None,
+                expires: None,
+            };
+            kademlia
+                .put_record(record, Quorum::One)
+                .expect("Failed to store record locally.");
+            kademlia.get_record(key, Quorum::One);
         }
         Some("VOTE") => {
             let key = {
                 match args.next() {
-                    Some(key) => key,
+                    Some(key) => Key::new(&format!("{}-{}", "VOTE", key)),
                     None => {
                         eprintln!("Expected key");
                         return;
@@ -359,12 +392,32 @@ fn handle_input_line(kademlia: &mut Kademlia<MemoryStore>,
                 }
             };
 
-           tally.clone().push_new(kademlia, key, yay_pref, nay_pref);
-           println!("Vote Cast!");
+            let record = Record {
+                key: key.clone(),
+                value: format!("{}-{}", yay_pref, nay_pref).as_bytes().to_vec(),
+                publisher: None,
+                expires: None,
+            };
+            kademlia
+                .put_record(record, Quorum::One)
+                .expect("Failed to store record locally.");
+            kademlia.get_record(key, Quorum::One);
+           
            
         }
         Some("TALLY") => {
-            println!("{:?}", tally.clone().tally_up());
+            let key = Key::new(&"TALLY");
+
+            let record = Record {
+                key: key.clone(),
+                value: format!("").as_bytes().to_vec(),
+                publisher: None,
+                expires: None,
+            };
+            kademlia
+                .put_record(record, Quorum::One)
+                .expect("Failed to store record locally.");
+            kademlia.get_record(key, Quorum::One);
 
         }
         _ => {
