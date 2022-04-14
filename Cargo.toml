@@ -1,0 +1,12 @@
+[package]
+name = "p2p-consensus-preferential"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libp2p = { version = "0.43.0",  features = ["tcp-tokio"] }
+futures = {version = "0.3.21", features=["executor"] }
+async-std = {version = "*", features = ["attributes"]}
+lazy_static = "1.0"
